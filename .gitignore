@@ -1,0 +1,5 @@
+.env
+__pycache__/
+.streamlit/
+chroma_db/
+jobs_cache.db
