@@ -4,7 +4,7 @@ groq
 python-dotenv
 fastapi
 uvicorn
-chromadb
 sentence-transformers
+numpy
 httpx
 pdfplumber
