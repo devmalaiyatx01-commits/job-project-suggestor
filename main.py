@@ -18,6 +18,13 @@ from embeddings import get_relevant_jobs
 from evaluator import evaluate_suggestions
 
 load_dotenv()
+def get_secret(key: str) -> str:
+    """Reads from Streamlit secrets when deployed, .env when local"""
+    try:
+        import streamlit as st
+        return st.secrets[key]
+    except Exception:
+        return os.getenv(key)
 init_db()
 
 app = FastAPI(

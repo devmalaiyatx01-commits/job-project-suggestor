@@ -3,11 +3,16 @@ import os
 import json
 import re
 from dotenv import load_dotenv
-
+def get_secret(key: str) -> str:
+    try:
+        import streamlit as st
+        return st.secrets[key]
+    except Exception:
+        return os.getenv(key)
 load_dotenv()
 
 def evaluate_suggestions(suggestions_text: str, query: str) -> list:
-    client = Groq(api_key=os.getenv("GROQ_API_KEY"))
+    client = Groq(api_key=get_secret("GROQ_API_KEY"))
 
     prompt = f"""You are an evaluator judging portfolio project suggestions for someone applying to "{query}" roles.
 
