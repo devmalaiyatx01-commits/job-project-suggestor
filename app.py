@@ -2,9 +2,344 @@ import streamlit as st
 import httpx
 import pdfplumber
 import io
+import os
+import json
+import re
+import requests
+from groq import Groq
 from auth import register_user, login_user, get_security_question, reset_password, SECURITY_QUESTIONS
+from database import (
+    init_db, get_cached_jobs, save_jobs_to_cache,
+    get_cached_suggestions, save_suggestions_to_cache,
+    log_search, get_user_search_history,
+    get_total_users, get_total_searches, get_top_searches
+)
+from embeddings import get_relevant_jobs
+from evaluator import evaluate_suggestions
 
+# Initialize database immediately when app starts
+init_db()
+
+# ── Secrets + API detection ───────────────────────────────────
+
+def get_secret(key: str) -> str:
+    try:
+        return st.secrets[key]
+    except Exception:
+        return os.getenv(key)
+
+def is_api_running() -> bool:
+    try:
+        httpx.get("http://localhost:8000/", timeout=2)
+        return True
+    except Exception:
+        return False
+
+API_AVAILABLE = is_api_running()
 API_URL = "http://localhost:8000"
+
+# ── Direct functions (bypass FastAPI on Streamlit Cloud) ──────
+
+def fetch_jobs_direct(query: str, location: str) -> list:
+    all_jobs = []
+    for page in range(1, 3):
+        url = "https://jsearch.p.rapidapi.com/search"
+        params = {
+            "query": query,
+            "location": location,
+            "page": str(page),
+            "num_pages": "1",
+            "date_posted": "month"
+        }
+        headers = {
+            "X-RapidAPI-Key": get_secret("RAPID_API_KEY"),
+            "X-RapidAPI-Host": "jsearch.p.rapidapi.com"
+        }
+        try:
+            response = requests.get(url, headers=headers, params=params, timeout=10)
+            if response.status_code == 200:
+                jobs = response.json().get("data", [])
+                all_jobs.extend(jobs)
+        except Exception:
+            pass
+    return all_jobs
+
+def extract_job_info_direct(jobs: list) -> list:
+    extracted = []
+    for job in jobs[:20]:
+        extracted.append({
+            "title": job.get("job_title", ""),
+            "company": job.get("employer_name", ""),
+            "description": (job.get("job_description", "") or "")[:800],
+            "skills": job.get("job_required_skills", []) or [],
+            "link": job.get("job_apply_link") or job.get("job_url") or "",
+            "location": job.get("job_city", "") or job.get("job_country", ""),
+        })
+    return extracted
+
+def generate_suggestions_direct(query: str, jobs_info: list) -> str:
+    client = Groq(api_key=get_secret("GROQ_API_KEY"))
+    jobs_text = ""
+    for i, job in enumerate(jobs_info, 1):
+        skills = ", ".join(job["skills"]) if job.get("skills") else "not specified"
+        jobs_text += f"\nJob {i}: {job['title']} at {job['company']}\nSkills: {skills}\nDescription: {job['description'][:400]}\n---"
+
+    prompt = f"""I searched for "{query}" jobs and found these {len(jobs_info)} listings:
+{jobs_text}
+
+Analyze ALL listings. Suggest 6-8 specific portfolio projects. For each:
+- **Project name** (concrete, not generic)
+- **What it does** (1-2 sentences)
+- **Key tech/skills it demonstrates**
+- **Why it works for these roles**
+- **Rough difficulty** (Weekend / 1 week / 2-3 weeks)
+
+Be extremely specific. Every project must connect to skills seen in multiple job listings."""
+
+    message = client.chat.completions.create(
+        model="llama-3.3-70b-versatile",
+        max_tokens=2000,
+        messages=[{"role": "user", "content": prompt}]
+    )
+    return message.choices[0].message.content
+
+def suggest_direct(query: str, location: str, username: str) -> dict:
+    cached_suggestions, cached_scores = get_cached_suggestions(query)
+    cached_jobs = get_cached_jobs(query, location) or []
+
+    if cached_suggestions and cached_scores:
+        log_search(username, query, location, len(cached_jobs))
+        return {
+            "query": query,
+            "job_count": len(cached_jobs),
+            "jobs_analyzed": [{
+                "title": j.get("title", ""),
+                "company": j.get("company", ""),
+                "link": j.get("link", ""),
+                "location": j.get("location", "")
+            } for j in cached_jobs[:15]],
+            "suggestions": cached_suggestions,
+            "scores": cached_scores,
+            "from_cache": True
+        }
+
+    jobs = get_cached_jobs(query, location)
+    if not jobs:
+        raw_jobs = fetch_jobs_direct(query, location)
+        if not raw_jobs:
+            return None
+        jobs = extract_job_info_direct(raw_jobs)
+        save_jobs_to_cache(query, location, jobs)
+
+    log_search(username, query, location, len(jobs))
+    relevant_jobs = get_relevant_jobs(query, jobs, top_k=10)
+    suggestions = generate_suggestions_direct(query, relevant_jobs)
+    scores = evaluate_suggestions(suggestions, query)
+    save_suggestions_to_cache(query, suggestions, scores)
+
+    return {
+        "query": query,
+        "job_count": len(jobs),
+        "jobs_analyzed": [{
+            "title": j.get("title", ""),
+            "company": j.get("company", ""),
+            "link": j.get("link", ""),
+            "location": j.get("location", "")
+        } for j in jobs[:15]],
+        "suggestions": suggestions,
+        "scores": scores,
+        "from_cache": False
+    }
+
+def analyze_resume_direct(resume_text: str, query: str, location: str) -> dict:
+    jobs = get_cached_jobs(query, location)
+    if not jobs:
+        raw_jobs = fetch_jobs_direct(query, location)
+        if not raw_jobs:
+            return None
+        jobs = extract_job_info_direct(raw_jobs)
+        save_jobs_to_cache(query, location, jobs)
+
+    job_summaries = ""
+    for i, job in enumerate(jobs[:10], 1):
+        job_summaries += f"Job {i} ({job['title']} at {job['company']}): {job['description'][:300]}\n---\n"
+
+    client = Groq(api_key=get_secret("GROQ_API_KEY"))
+    prompt = f"""You are an expert ATS analyst and career coach.
+
+TARGET ROLE: {query}
+
+REAL JOB LISTINGS:
+{job_summaries}
+
+CANDIDATE RESUME:
+{resume_text[:3000]}
+
+Respond ONLY with valid JSON, no markdown, no backticks:
+{{
+  "ats_score": <0-100>,
+  "fit_score": <0-100>,
+  "keyword_analysis": {{
+    "present": ["<keyword>"],
+    "missing": ["<keyword>"]
+  }},
+  "strengths": ["<strength 1>", "<strength 2>", "<strength 3>"],
+  "gaps": ["<gap 1>", "<gap 2>", "<gap 3>"],
+  "ats_formatting_tips": ["<tip 1>", "<tip 2>", "<tip 3>"],
+  "quick_wins": ["<win 1>", "<win 2>", "<win 3>"],
+  "overall_verdict": "<2-3 sentence honest assessment>"
+}}"""
+
+    message = client.chat.completions.create(
+        model="llama-3.3-70b-versatile",
+        max_tokens=2000,
+        messages=[{"role": "user", "content": prompt}]
+    )
+    raw = re.sub(r"```json|```", "", message.choices[0].message.content.strip()).strip()
+    try:
+        return json.loads(raw)
+    except Exception:
+        return {
+            "ats_score": 0, "fit_score": 0,
+            "keyword_analysis": {"present": [], "missing": []},
+            "strengths": [], "gaps": [],
+            "ats_formatting_tips": [], "quick_wins": [],
+            "overall_verdict": raw
+        }
+
+def roadmap_direct(resume_text: str, query: str) -> dict:
+    client = Groq(api_key=get_secret("GROQ_API_KEY"))
+    prompt = f"""You are a senior career coach for tech roles in India.
+
+TARGET ROLE: {query}
+RESUME: {resume_text[:3000]}
+
+Create a 6-month personalized roadmap. Respond ONLY with valid JSON, no markdown, no backticks:
+{{
+  "current_level": "<honest assessment of where they are>",
+  "target_outcome": "<what they achieve in 6 months>",
+  "months": [
+    {{
+      "month": 1,
+      "title": "<theme for this month>",
+      "focus": "<what to learn or build and why>",
+      "weekly_hours": <number>,
+      "goals": ["<goal 1>", "<goal 2>", "<goal 3>"],
+      "resources": [
+        {{
+          "name": "<resource name>",
+          "url": "<real working url>",
+          "type": "<Course / YouTube / Platform / Book>",
+          "cost": "Free",
+          "why": "<why this resource for this candidate>"
+        }}
+      ],
+      "milestone": "<what they have to show at end of month>"
+    }},
+    {{
+      "month": 2,
+      "title": "<theme>",
+      "focus": "<focus>",
+      "weekly_hours": <number>,
+      "goals": ["<goal 1>", "<goal 2>", "<goal 3>"],
+      "resources": [{{"name": "<name>", "url": "<url>", "type": "<type>", "cost": "Free", "why": "<why>"}}],
+      "milestone": "<milestone>"
+    }},
+    {{
+      "month": 3,
+      "title": "<theme>",
+      "focus": "<focus>",
+      "weekly_hours": <number>,
+      "goals": ["<goal 1>", "<goal 2>", "<goal 3>"],
+      "resources": [{{"name": "<name>", "url": "<url>", "type": "<type>", "cost": "Free", "why": "<why>"}}],
+      "milestone": "<milestone>"
+    }},
+    {{
+      "month": 4,
+      "title": "<theme>",
+      "focus": "<focus>",
+      "weekly_hours": <number>,
+      "goals": ["<goal 1>", "<goal 2>", "<goal 3>"],
+      "resources": [{{"name": "<name>", "url": "<url>", "type": "<type>", "cost": "Free", "why": "<why>"}}],
+      "milestone": "<milestone>"
+    }},
+    {{
+      "month": 5,
+      "title": "<theme>",
+      "focus": "<focus>",
+      "weekly_hours": <number>,
+      "goals": ["<goal 1>", "<goal 2>", "<goal 3>"],
+      "resources": [{{"name": "<name>", "url": "<url>", "type": "<type>", "cost": "Free", "why": "<why>"}}],
+      "milestone": "<milestone>"
+    }},
+    {{
+      "month": 6,
+      "title": "<theme>",
+      "focus": "<focus>",
+      "weekly_hours": <number>,
+      "goals": ["<goal 1>", "<goal 2>", "<goal 3>"],
+      "resources": [{{"name": "<name>", "url": "<url>", "type": "<type>", "cost": "Free", "why": "<why>"}}],
+      "milestone": "<milestone>"
+    }}
+  ],
+  "interview_prep": {{
+    "topics": ["<topic 1>", "<topic 2>", "<topic 3>", "<topic 4>", "<topic 5>"],
+    "resources": [
+      {{"name": "<name>", "url": "<url>", "type": "<type>", "cost": "Free"}},
+      {{"name": "<name>", "url": "<url>", "type": "<type>", "cost": "Free"}}
+    ]
+  }},
+  "final_checklist": ["<item 1>", "<item 2>", "<item 3>", "<item 4>", "<item 5>"]
+}}
+
+Use REAL specific free resource URLs like cs50p.harvard.edu, fast.ai, kaggle.com/learn, neetcode.io, stratascratch.com, mode.com/sql-tutorial, statquest.org. Include all 6 months."""
+
+    message = client.chat.completions.create(
+        model="llama-3.3-70b-versatile",
+        max_tokens=4000,
+        messages=[{"role": "user", "content": prompt}]
+    )
+    raw = re.sub(r"```json|```", "", message.choices[0].message.content.strip()).strip()
+    try:
+        return json.loads(raw)
+    except Exception:
+        return None
+
+def fetch_stats():
+    if API_AVAILABLE:
+        try:
+            resp = httpx.get(f"{API_URL}/stats", timeout=5)
+            if resp.status_code == 200:
+                return resp.json()
+        except Exception:
+            pass
+    return {
+        "total_users": get_total_users(),
+        "total_searches": get_total_searches(),
+        "top_searches": [{"query": r[0], "count": r[1]} for r in get_top_searches(5)]
+    }
+
+def extract_text_from_pdf(file_bytes: bytes) -> str:
+    text = ""
+    try:
+        with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
+            for page in pdf.pages:
+                page_text = page.extract_text()
+                if page_text:
+                    text += page_text + "\n"
+    except Exception:
+        pass
+    return text.strip()
+
+def score_label(score: int) -> str:
+    if score >= 75:
+        return "Strong ✅"
+    elif score >= 50:
+        return "Moderate ⚠️"
+    else:
+        return "Needs Work ❌"
+
+# ── Page config ───────────────────────────────────────────────
 
 st.set_page_config(
     page_title="Job Project Suggester",
@@ -20,47 +355,6 @@ if "username" not in st.session_state:
 if "resume_text" not in st.session_state:
     st.session_state.resume_text = ""
 
-# ── Helper functions ──────────────────────────────────────────
-
-def fetch_stats():
-    try:
-        resp = httpx.get(f"{API_URL}/stats", timeout=5)
-        if resp.status_code == 200:
-            return resp.json()
-    except Exception:
-        pass
-    return {"total_users": 0, "total_searches": 0, "top_searches": []}
-
-def extract_text_from_pdf(file_bytes: bytes) -> str:
-    """Extract all text from a PDF file"""
-    text = ""
-    try:
-        with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
-            for page in pdf.pages:
-                page_text = page.extract_text()
-                if page_text:
-                    text += page_text + "\n"
-    except Exception as e:
-        text = ""
-    return text.strip()
-
-def score_color(score: int) -> str:
-    """Returns a color based on score value"""
-    if score >= 75:
-        return "green"
-    elif score >= 50:
-        return "orange"
-    else:
-        return "red"
-
-def score_label(score: int) -> str:
-    if score >= 75:
-        return "Strong ✅"
-    elif score >= 50:
-        return "Moderate ⚠️"
-    else:
-        return "Needs Work ❌"
-
 # ── Header ────────────────────────────────────────────────────
 stats = fetch_stats()
 
@@ -70,7 +364,7 @@ col_u, col_s, col_gap = st.columns([1, 1, 2])
 col_u.metric("👥 Total Users", stats["total_users"])
 col_s.metric("🔍 Total Searches", stats["total_searches"])
 
-st.markdown("*Search any job role → get real listings → AI tells you what to build, how your resume scores, and your 6-month plan*")
+st.markdown("*Search any job role → get real listings with apply links → AI tells you what to build, scores your resume, and gives you a 6-month plan*")
 st.markdown("---")
 
 # ── Auth flow ─────────────────────────────────────────────────
@@ -111,7 +405,7 @@ if not st.session_state.logged_in:
         st.markdown("**Security question** (used if you forget your password)")
         security_q = st.selectbox("Choose a question", SECURITY_QUESTIONS, key="security_q")
         security_a = st.text_input("Your answer", key="security_a",
-                                    help="Remember this — you'll need it to reset your password")
+                                    help="Remember this — you will need it to reset your password")
 
         if st.button("Create Account", type="primary"):
             if not reg_username or not reg_password or not security_a:
@@ -188,26 +482,27 @@ else:
         st.markdown("---")
         st.markdown("### 🕐 Your Search History")
         try:
-            history_resp = httpx.get(
-                f"{API_URL}/history/{st.session_state.username}", timeout=5
-            )
-            if history_resp.status_code == 200:
-                history = history_resp.json().get("history", [])
-                if history:
-                    for item in history:
-                        st.markdown(f"**{item['query']}** — {item['job_count']} jobs")
-                else:
-                    st.markdown("*No searches yet*")
+            rows = get_user_search_history(st.session_state.username)
+            if rows:
+                for r in rows:
+                    st.markdown(f"**{r[0]}** — {r[2]} jobs")
+            else:
+                st.markdown("*No searches yet*")
         except Exception:
             st.markdown("*Could not load history*")
 
         st.markdown("---")
         if st.button("🗑️ Clear Job Cache"):
             try:
-                httpx.delete(f"{API_URL}/cache")
+                import sqlite3
+                conn = sqlite3.connect("jobs_cache.db")
+                conn.execute("DELETE FROM job_cache")
+                conn.execute("DELETE FROM suggestion_cache")
+                conn.commit()
+                conn.close()
                 st.success("Cache cleared!")
-            except Exception:
-                st.error("Could not reach API")
+            except Exception as e:
+                st.error(f"Error: {e}")
 
         st.markdown("---")
         st.markdown("### 📊 Platform Stats")
@@ -219,7 +514,7 @@ else:
             for item in top:
                 st.markdown(f"- {item['query']} ({item['count']}x)")
 
-    # ── Resume upload (persistent across tabs) ────────────────
+    # ── Resume upload panel ───────────────────────────────────
     st.markdown(f"Welcome, **{st.session_state.username}**!")
 
     with st.expander("📄 Upload Your Resume (used across all features)", expanded=not st.session_state.resume_text):
@@ -232,11 +527,7 @@ else:
         )
 
         if upload_method == "Upload PDF":
-            uploaded_file = st.file_uploader(
-                "Upload your resume PDF",
-                type=["pdf"],
-                help="Max 5MB"
-            )
+            uploaded_file = st.file_uploader("Upload your resume PDF", type=["pdf"])
             if uploaded_file:
                 file_bytes = uploaded_file.read()
                 extracted = extract_text_from_pdf(file_bytes)
@@ -247,7 +538,6 @@ else:
                         st.text(extracted[:1000] + "..." if len(extracted) > 1000 else extracted)
                 else:
                     st.error("Could not extract text from this PDF. Try the paste option instead.")
-
         else:
             pasted = st.text_area(
                 "Paste your resume text here",
@@ -291,50 +581,41 @@ else:
         if st.button("🔍 Find Projects to Build", type="primary", disabled=not query, key="btn_tab1"):
             with st.spinner("Fetching jobs and running AI analysis... (first search ~30 seconds)"):
                 try:
-                    response = httpx.post(
-                        f"{API_URL}/suggest",
-                        json={
-                            "query": query,
-                            "location": location,
-                            "username": st.session_state.username
-                        },
-                        timeout=120
-                    )
+                    if API_AVAILABLE:
+                        response = httpx.post(
+                            f"{API_URL}/suggest",
+                            json={"query": query, "location": location, "username": st.session_state.username},
+                            timeout=120
+                        )
+                        data = response.json() if response.status_code == 200 else None
+                        if response.status_code != 200:
+                            st.error(f"Error: {response.text}")
+                    else:
+                        data = suggest_direct(query, location, st.session_state.username)
 
-                    if response.status_code == 200:
-                        data = response.json()
-
+                    if data:
                         if data.get("from_cache"):
                             st.info("⚡ Loaded from cache — instant!")
                         else:
                             st.success(f"✅ Analyzed {data['job_count']} live listings for **{query}**")
 
-                        # Job listings
                         st.markdown("---")
                         st.markdown("## 📋 Jobs Found — Apply Directly")
-                        jobs = data.get("jobs_analyzed", [])
-                        if jobs:
-                            for job in jobs:
-                                title = job.get("title", "Unknown Role")
-                                company = job.get("company", "Unknown")
-                                link = job.get("link", "")
-                                loc = job.get("location", "")
-                                col_info, col_btn = st.columns([4, 1])
-                                with col_info:
-                                    loc_text = f" · 📍 {loc}" if loc else ""
-                                    st.markdown(f"**{title}** at {company}{loc_text}")
-                                with col_btn:
-                                    if link:
-                                        st.markdown(f"[🔗 Apply]({link})")
-                                    else:
-                                        st.markdown("*No link*")
+                        for job in data.get("jobs_analyzed", []):
+                            col_info, col_btn = st.columns([4, 1])
+                            with col_info:
+                                loc_text = f" · 📍 {job.get('location','')}" if job.get("location") else ""
+                                st.markdown(f"**{job.get('title','?')}** at {job.get('company','?')}{loc_text}")
+                            with col_btn:
+                                if job.get("link"):
+                                    st.markdown(f"[🔗 Apply]({job['link']})")
+                                else:
+                                    st.markdown("*No link*")
 
-                        # Suggestions
                         st.markdown("---")
                         st.markdown("## 🚀 Projects to Build for Your Resume")
                         st.markdown(data["suggestions"])
 
-                        # Scores
                         scores = data.get("scores", [])
                         if scores:
                             st.markdown("---")
@@ -356,14 +637,9 @@ else:
                             file_name=f"projects_for_{query.replace(' ','_')}.txt",
                             mime="text/plain"
                         )
-
-                    elif response.status_code == 404:
-                        st.error("No jobs found. Try a different role or location.")
                     else:
-                        st.error(f"Error: {response.text}")
+                        st.error("No jobs found. Try a different role or location.")
 
-                except httpx.ConnectError:
-                    st.error("❌ Cannot reach API. Make sure Terminal 1 is running: uvicorn main:app --reload")
                 except Exception as e:
                     st.error(f"Something went wrong: {str(e)}")
 
@@ -387,111 +663,77 @@ else:
             if st.button("📊 Analyze My Resume", type="primary", disabled=not ats_query, key="btn_tab2"):
                 with st.spinner("Fetching job listings and analyzing your resume... (~20 seconds)"):
                     try:
-                        response = httpx.post(
-                            f"{API_URL}/analyze-resume",
-                            json={
-                                "resume_text": st.session_state.resume_text,
-                                "query": ats_query,
-                                "location": ats_location,
-                                "username": st.session_state.username
-                            },
-                            timeout=120
-                        )
+                        if API_AVAILABLE:
+                            response = httpx.post(
+                                f"{API_URL}/analyze-resume",
+                                json={
+                                    "resume_text": st.session_state.resume_text,
+                                    "query": ats_query,
+                                    "location": ats_location,
+                                    "username": st.session_state.username
+                                },
+                                timeout=120
+                            )
+                            data = response.json() if response.status_code == 200 else None
+                        else:
+                            data = analyze_resume_direct(
+                                st.session_state.resume_text, ats_query, ats_location
+                            )
 
-                        if response.status_code == 200:
-                            data = response.json()
-
-                            # ── Score cards ───────────────────
-                            st.markdown("---")
-                            st.markdown("## 🎯 Your Scores")
-
+                        if data:
                             ats = data.get("ats_score", 0)
                             fit = data.get("fit_score", 0)
 
-                            col_ats, col_fit, col_gap = st.columns([1, 1, 2])
-
+                            st.markdown("---")
+                            st.markdown("## 🎯 Your Scores")
+                            col_ats, col_fit, _ = st.columns([1, 1, 2])
                             with col_ats:
-                                st.metric(
-                                    "ATS Score",
-                                    f"{ats}/100",
-                                    delta=score_label(ats)
-                                )
+                                st.metric("ATS Score", f"{ats}/100", delta=score_label(ats))
                                 st.progress(ats / 100)
-
                             with col_fit:
-                                st.metric(
-                                    "Job Fit Score",
-                                    f"{fit}/100",
-                                    delta=score_label(fit)
-                                )
+                                st.metric("Job Fit Score", f"{fit}/100", delta=score_label(fit))
                                 st.progress(fit / 100)
 
-                            # ── Overall verdict ───────────────
                             st.markdown("---")
                             st.markdown("### 💬 Overall Assessment")
                             st.info(data.get("overall_verdict", ""))
 
-                            # ── Keywords ──────────────────────
                             st.markdown("---")
                             st.markdown("### 🔑 Keyword Analysis")
-
                             kw = data.get("keyword_analysis", {})
-                            present = kw.get("present", [])
-                            missing = kw.get("missing", [])
-
                             col_p, col_m = st.columns(2)
-
                             with col_p:
                                 st.markdown("**✅ Keywords you have:**")
-                                if present:
-                                    for kw_item in present:
-                                        st.markdown(f"- {kw_item}")
-                                else:
-                                    st.markdown("*None detected*")
-
+                                for k in kw.get("present", []):
+                                    st.markdown(f"- {k}")
                             with col_m:
-                                st.markdown("**❌ Keywords you're missing:**")
-                                if missing:
-                                    for kw_item in missing:
-                                        st.markdown(f"- {kw_item}")
-                                else:
-                                    st.markdown("*None — great coverage!*")
+                                st.markdown("**❌ Keywords missing:**")
+                                for k in kw.get("missing", []):
+                                    st.markdown(f"- {k}")
 
-                            # ── Strengths & Gaps ──────────────
                             st.markdown("---")
                             col_str, col_gap2 = st.columns(2)
-
                             with col_str:
                                 st.markdown("### 💪 Your Strengths")
                                 for s in data.get("strengths", []):
                                     st.success(s)
-
                             with col_gap2:
                                 st.markdown("### 🔧 Gaps to Address")
                                 for g in data.get("gaps", []):
                                     st.error(g)
 
-                            # ── Formatting tips ───────────────
                             st.markdown("---")
                             st.markdown("### 📝 ATS Formatting Tips")
-                            st.caption("These are specific issues detected in your resume")
                             for tip in data.get("ats_formatting_tips", []):
                                 st.warning(tip)
 
-                            # ── Quick wins ────────────────────
                             st.markdown("---")
                             st.markdown("### ⚡ Quick Wins — Do These This Week")
-                            st.caption("Small changes that immediately improve your ATS score")
                             for i, win in enumerate(data.get("quick_wins", []), 1):
                                 st.markdown(f"**{i}.** {win}")
-
-                        elif response.status_code == 404:
-                            st.error("No jobs found for this role. Try a different title.")
                         else:
-                            st.error(f"Error: {response.text}")
+                            st.error("No jobs found for this role. Try a different title.")
 
-                    except httpx.ConnectError:
-                        st.error("❌ Cannot reach API. Make sure Terminal 1 is running.")
                     except Exception as e:
                         st.error(f"Something went wrong: {str(e)}")
 
@@ -512,21 +754,21 @@ else:
                          disabled=not roadmap_query, key="btn_tab3"):
                 with st.spinner("Building your personalized roadmap... (~30 seconds)"):
                     try:
-                        response = httpx.post(
-                            f"{API_URL}/roadmap",
-                            json={
-                                "resume_text": st.session_state.resume_text,
-                                "query": roadmap_query,
-                                "username": st.session_state.username
-                            },
-                            timeout=120
-                        )
+                        if API_AVAILABLE:
+                            response = httpx.post(
+                                f"{API_URL}/roadmap",
+                                json={
+                                    "resume_text": st.session_state.resume_text,
+                                    "query": roadmap_query,
+                                    "username": st.session_state.username
+                                },
+                                timeout=120
+                            )
+                            data = response.json() if response.status_code == 200 else None
+                        else:
+                            data = roadmap_direct(st.session_state.resume_text, roadmap_query)
 
-                        if response.status_code == 200:
-                            data = response.json()
-
-                            # ── Summary ───────────────────────
-                            st.markdown("---")
+                        if data:
                             col_now, col_then = st.columns(2)
                             with col_now:
                                 st.markdown("### 📍 Where You Are Now")
@@ -535,91 +777,64 @@ else:
                                 st.markdown("### 🎯 Where You'll Be in 6 Months")
                                 st.success(data.get("target_outcome", ""))
 
-                            # ── Monthly breakdown ─────────────
                             st.markdown("---")
                             st.markdown("## 📅 Month-by-Month Plan")
 
-                            months = data.get("months", [])
-                            for month_data in months:
-                                month_num = month_data.get("month", "")
-                                title = month_data.get("title", "")
-                                focus = month_data.get("focus", "")
-                                weekly_hours = month_data.get("weekly_hours", "")
-                                goals = month_data.get("goals", [])
-                                resources = month_data.get("resources", [])
-                                milestone = month_data.get("milestone", "")
-
+                            for m in data.get("months", []):
                                 with st.expander(
-                                    f"**Month {month_num}: {title}** — {weekly_hours}hrs/week",
-                                    expanded=(month_num == 1)
+                                    f"**Month {m.get('month')}: {m.get('title')}** — {m.get('weekly_hours')}hrs/week",
+                                    expanded=(m.get("month") == 1)
                                 ):
-                                    st.markdown(f"**🎯 Focus:** {focus}")
-                                    st.markdown(f"**⏱️ Time commitment:** {weekly_hours} hours per week")
+                                    st.markdown(f"**🎯 Focus:** {m.get('focus')}")
+                                    st.markdown(f"**⏱️ Time commitment:** {m.get('weekly_hours')} hours/week")
 
                                     st.markdown("**📌 Goals this month:**")
-                                    for goal in goals:
-                                        st.markdown(f"- {goal}")
+                                    for g in m.get("goals", []):
+                                        st.markdown(f"- {g}")
 
-                                    if resources:
-                                        st.markdown("**📚 Resources:**")
-                                        for res in resources:
-                                            name = res.get("name", "")
-                                            url = res.get("url", "")
-                                            res_type = res.get("type", "")
-                                            why = res.get("why", "")
-                                            cost = res.get("cost", "Free")
-
-                                            col_res, col_type = st.columns([3, 1])
-                                            with col_res:
-                                                if url:
-                                                    st.markdown(f"🔗 [{name}]({url})")
-                                                else:
-                                                    st.markdown(f"📖 {name}")
-                                                if why:
-                                                    st.caption(why)
-                                            with col_type:
-                                                st.caption(f"{res_type} · {cost}")
+                                    st.markdown("**📚 Resources:**")
+                                    for r in m.get("resources", []):
+                                        col_r, col_t = st.columns([3, 1])
+                                        with col_r:
+                                            if r.get("url"):
+                                                st.markdown(f"🔗 [{r.get('name')}]({r.get('url')})")
+                                            else:
+                                                st.markdown(f"📖 {r.get('name')}")
+                                            if r.get("why"):
+                                                st.caption(r.get("why"))
+                                        with col_t:
+                                            st.caption(f"{r.get('type','Resource')} · {r.get('cost','Free')}")
 
                                     st.markdown("---")
-                                    st.success(f"🏁 **End of month milestone:** {milestone}")
+                                    st.success(f"🏁 **End of month milestone:** {m.get('milestone')}")
 
-                            # ── Interview prep ────────────────
                             interview = data.get("interview_prep", {})
                             if interview:
                                 st.markdown("---")
                                 st.markdown("## 🎤 Interview Preparation")
-
                                 topics = interview.get("topics", [])
                                 if topics:
                                     st.markdown("**Topics to master:**")
-                                    cols = st.columns(min(len(topics), 3))
-                                    for i, topic in enumerate(topics):
-                                        cols[i % 3].markdown(f"- {topic}")
+                                    for topic in topics:
+                                        st.markdown(f"- {topic}")
+                                for r in interview.get("resources", []):
+                                    if r.get("url"):
+                                        st.markdown(f"🔗 [{r.get('name')}]({r.get('url')})")
+                                    else:
+                                        st.markdown(f"📖 {r.get('name')}")
 
-                                int_resources = interview.get("resources", [])
-                                if int_resources:
-                                    st.markdown("**Resources:**")
-                                    for res in int_resources:
-                                        name = res.get("name", "")
-                                        url = res.get("url", "")
-                                        if url:
-                                            st.markdown(f"🔗 [{name}]({url})")
-                                        else:
-                                            st.markdown(f"📖 {name}")
-
-                            # ── Final checklist ───────────────
                             checklist = data.get("final_checklist", [])
                             if checklist:
                                 st.markdown("---")
                                 st.markdown("## ✅ Before You Apply — Final Checklist")
                                 for item in checklist:
-                                    st.checkbox(item, key=f"check_{item[:20]}")
+                                    st.checkbox(item, key=f"chk_{item[:30]}")
 
-                            # ── Download roadmap ──────────────
+                            # Build downloadable roadmap text
                             roadmap_text = f"6-MONTH ROADMAP FOR: {roadmap_query}\n\n"
-                            roadmap_text += f"Current Level: {data.get('current_level', '')}\n"
-                            roadmap_text += f"Target: {data.get('target_outcome', '')}\n\n"
-                            for m in months:
+                            roadmap_text += f"Current Level: {data.get('current_level','')}\n"
+                            roadmap_text += f"Target: {data.get('target_outcome','')}\n\n"
+                            for m in data.get("months", []):
                                 roadmap_text += f"\nMONTH {m.get('month')}: {m.get('title')}\n"
                                 roadmap_text += f"Focus: {m.get('focus')}\n"
                                 roadmap_text += f"Hours/week: {m.get('weekly_hours')}\n"
@@ -628,7 +843,7 @@ else:
                                     roadmap_text += f"  - {g}\n"
                                 roadmap_text += "Resources:\n"
                                 for r in m.get("resources", []):
-                                    roadmap_text += f"  - {r.get('name')} ({r.get('url', 'no url')})\n"
+                                    roadmap_text += f"  - {r.get('name')} ({r.get('url','no url')})\n"
                                 roadmap_text += f"Milestone: {m.get('milestone')}\n"
 
                             st.download_button(
@@ -637,11 +852,8 @@ else:
                                 file_name=f"roadmap_{roadmap_query.replace(' ','_')}.txt",
                                 mime="text/plain"
                             )
-
                         else:
-                            st.error(f"Error: {response.text}")
+                            st.error("Could not generate roadmap. Try again.")
 
-                    except httpx.ConnectError:
-                        st.error("❌ Cannot reach API. Make sure Terminal 1 is running.")
                     except Exception as e:
                         st.error(f"Something went wrong: {str(e)}")
